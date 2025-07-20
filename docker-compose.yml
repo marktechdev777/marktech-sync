@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  marktech-sync:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - GITHUB_TOKEN
+      - GITHUB_USERNAME
+      - GITEE_TOKEN
+      - GITEE_USERNAME
+      - BITBUCKET_TOKEN
+      - BITBUCKET_USERNAME
+      - GITLAB_TOKEN
+      - GITLAB_USERNAME
+      - TEAMS_WEBHOOK_URL
+      - MARKTECH_SYNC_URL
+    command:
+      - /bin/bash
+      - -c
+      - |
+        apt-get update
+        apt-get install -y git
+        git clone $MARKTECH_SYNC_URL /app/repo
+        pip install requests
+        cd /app/repo
+        python main.py
