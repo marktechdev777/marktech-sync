@@ -299,7 +299,8 @@ class GitLabDestination:
         return None
 
 def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
-                teams_webhook_url=None, provider=None, repo_idx=None, repo_total=None, repo_path=None, branch_idx=None, branch_total=None):
+                teams_webhook_url=None, provider=None, repo_idx=None, repo_total=None, repo_path=None, branch_idx=None, branch_total=None,
+                dest_author_name=None, dest_author_email=None):
     CLONE_RETRIES = 3
     CLONE_DELAY = 30
     CLONE_TIMEOUT = 600
@@ -326,8 +327,8 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
                 return {"status": "failed", "message": msg}
 
-            if DEST_AUTHOR_NAME and DEST_AUTHOR_EMAIL:
-                success = rewrite_authors(repo_dir_path, DEST_AUTHOR_NAME, DEST_AUTHOR_EMAIL, logger, log_ctx=prefix)
+            if dest_author_name and dest_author_email:
+                success = rewrite_authors(repo_dir_path, dest_author_name, dest_author_email, logger, log_ctx=prefix)
                 if not success:
                     msg = f"{prefix} Author rewrite failed for branch '{branch}' in {repo_dir_path}."
                     logger.error(msg)
@@ -448,7 +449,8 @@ def main():
                         source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                         teams_webhook_url=TEAMS_WEBHOOK_URL, provider=provider_label,
                         repo_idx=repo_idx, repo_total=repo_total,
-                        repo_path=repo_path, branch_idx=branch_idx, branch_total=branch_total
+                        repo_path=repo_path, branch_idx=branch_idx, branch_total=branch_total,
+                        dest_author_name=DEST_AUTHOR_NAME, dest_author_email=DEST_AUTHOR_EMAIL
                     )
                     sync_results.append({
                         "provider": provider_label,
