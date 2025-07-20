@@ -177,9 +177,13 @@ class GiteeSource:
         repositories = []
         page = 1
         while True:
-            url = f"{self.api_url}/users/{self.username}/repos"
+            url = f"{self.api_url}/user/repos"
             try:
-                response = requests.get(url, params={"access_token": self.access_token, "page": page, "per_page": 100}, timeout=20)
+                response = requests.get(
+                    url,
+                    params={"access_token": self.access_token, "page": page, "per_page": 100},
+                    timeout=20
+                )
                 if response.status_code != 200:
                     logger.error(f"Gitee API error {response.status_code}: {response.text}")
                     break
