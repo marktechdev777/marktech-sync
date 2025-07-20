@@ -326,9 +326,6 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
                 return {"status": "failed", "message": msg}
 
-            # --- AUTHOR REWRITE, if set ---
-            DEST_AUTHOR_NAME = os.environ.get("DEST_AUTHOR_NAME")
-            DEST_AUTHOR_EMAIL = os.environ.get("DEST_AUTHOR_EMAIL")
             if DEST_AUTHOR_NAME and DEST_AUTHOR_EMAIL:
                 success = rewrite_authors(repo_dir_path, DEST_AUTHOR_NAME, DEST_AUTHOR_EMAIL, logger, log_ctx=prefix)
                 if not success:
@@ -402,6 +399,8 @@ def main():
     GITLAB_USERNAME = os.environ.get("GITLAB_USERNAME")
     TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
     SLEEP_SECONDS = int(os.environ.get("SYNC_INTERVAL", "300"))  # Default: 5 minutes
+    DEST_AUTHOR_NAME = os.environ.get("DEST_AUTHOR_NAME")
+    DEST_AUTHOR_EMAIL = os.environ.get("DEST_AUTHOR_EMAIL")
 
     sources = []
     if GITHUB_TOKEN and GITHUB_USERNAME:
