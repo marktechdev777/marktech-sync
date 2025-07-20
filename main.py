@@ -5,7 +5,6 @@ import tempfile
 import logging
 import requests
 from datetime import datetime
-from urllib.parse import urlparse
 import time
 
 # ---- LOGGING SETUP ----
@@ -61,16 +60,33 @@ def create_gitlab_destination_path(provider, repo_path):
 def safe_dir_name(path):
     return re.sub(r'[^a-zA-Z0-9_\-]', '-', path)
 
-def run_command(cmd, cwd=None):
-    # Redact tokens in any logged URLs
+def run_command(cmd, cwd=None, retries=3, retry_delay=20, timeout=600):
     display_cmd = [re.sub(r"://[^:]+:[^@]+@", "://<redacted>@", a) if "@" in a else a for a in cmd]
-    logger.info(f"Running: {' '.join(display_cmd)}")
-    try:
-        result = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-        return result
-    except Exception as exc:
-        logger.error(f"Command failed: {' '.join(display_cmd)} | Exception: {exc}")
-        return None
+    attempt = 1
+    while attempt <= retries:
+        logger.info(f"Running (attempt {attempt}/{retries}): {' '.join(display_cmd)}")
+        start_time = time.time()
+        try:
+            result = subprocess.run(
+                cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"Command duration: {elapsed:.2f} seconds")
+            if result.returncode == 0:
+                return result
+            else:
+                logger.error(f"Command failed (attempt {attempt}): {' '.join(display_cmd)} | "
+                             f"Return code: {result.returncode} | Stderr: {result.stderr.decode().strip()}")
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start_time
+            logger.error(f"Command timed out (attempt {attempt}): {' '.join(display_cmd)} | Timeout: {timeout}s after {elapsed:.2f}s")
+        except Exception as exc:
+            logger.error(f"Command error (attempt {attempt}): {' '.join(display_cmd)} | Exception: {exc}")
+        attempt += 1
+        if attempt <= retries:
+            logger.info(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    return None
 
 class GitHubSource:
     def __init__(self, access_token, username):
@@ -207,23 +223,19 @@ class GitLabDestination:
         self.access_token = access_token
 
     def get_destination_url(self, repo_path):
-        # Authenticated HTTPS URL for push
         return f"https://{self.username}:{self.access_token}@gitlab.com/{repo_path}.git"
 
     def ensure_project_exists(self, repo_path):
-        # repo_path: e.g. "marktech-sync/github/user-repo"
         try:
             namespace, name = repo_path.rsplit("/", 1)
             group_id = self.get_group_id(namespace)
             if not group_id:
                 logger.error(f"GitLab group '{namespace}' not found. Cannot create project '{name}'.")
                 return False
-            # Check if project exists
             url = f"{self.api_url}/projects/{namespace.replace('/', '%2F')}%2F{name}"
             r = requests.get(url, headers=self.headers)
             if r.status_code == 200:
                 return True  # Project exists
-            # Otherwise, create project
             create_url = f"{self.api_url}/projects"
             data = {
                 "name": name,
@@ -242,35 +254,47 @@ class GitLabDestination:
             return False
 
     def get_group_id(self, namespace):
-        # namespace: e.g. "marktech-sync/github"
         url = f"{self.api_url}/groups/{namespace.replace('/', '%2F')}"
         r = requests.get(url, headers=self.headers)
         if r.status_code == 200:
             return r.json()["id"]
-        # Optionally, try to create the group here if not found.
         return None
 
 def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name, teams_webhook_url=None, provider=None):
+    CLONE_RETRIES = 3
+    CLONE_DELAY = 30
+    CLONE_TIMEOUT = 600
+    PUSH_RETRIES = 3
+    PUSH_DELAY = 30
+    PUSH_TIMEOUT = 600
+
     with tempfile.TemporaryDirectory() as temp_dir:
         repo_dir_path = os.path.join(temp_dir, repo_dir_name)
         try:
-            clone_result = run_command([
-                "git", "clone", "--single-branch", "--branch", branch, source_clone_url, repo_dir_path
-            ], cwd=temp_dir)
+            clone_result = run_command(
+                ["git", "clone", "--single-branch", "--branch", branch, source_clone_url, repo_dir_path],
+                cwd=temp_dir, retries=CLONE_RETRIES, retry_delay=CLONE_DELAY, timeout=CLONE_TIMEOUT
+            )
             if not clone_result or clone_result.returncode != 0:
-                msg = f"Failed to clone branch '{branch}' from {source_clone_url} | {clone_result.stderr.decode() if clone_result else ''}"
+                stderr = clone_result.stderr.decode() if clone_result else ''
+                msg = (f"Failed to clone branch '{branch}' from {source_clone_url} after {CLONE_RETRIES} attempts. "
+                       f"Last error: {stderr}")
                 logger.error(msg)
                 if teams_webhook_url:
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
                 return
 
-            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path)
-            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path)
+            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path, retries=1)
+            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path, retries=1)
 
-            push_result = run_command(["git", "push", "-u", "destination", f"{branch}:{branch}"], cwd=repo_dir_path)
+            push_result = run_command(
+                ["git", "push", "-u", "destination", f"{branch}:{branch}"],
+                cwd=repo_dir_path, retries=PUSH_RETRIES, retry_delay=PUSH_DELAY, timeout=PUSH_TIMEOUT
+            )
             if not push_result or push_result.returncode != 0:
-                stderr = push_result.stderr.decode() if push_result else ""
-                msg = f"Failed to push branch '{branch}' to {destination_gitlab_url} | {stderr}"
+                stderr = push_result.stderr.decode() if push_result else ''
+                msg = (f"Failed to push branch '{branch}' to {destination_gitlab_url} after {PUSH_RETRIES} attempts. "
+                       f"Last error: {stderr}")
                 logger.error(msg)
                 if teams_webhook_url:
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
@@ -321,19 +345,15 @@ def main():
             logger.info(f"==== Syncing repositories from {provider_label.upper()} ====")
             repositories = source_provider.fetch_all_repositories()
             for repo_info in repositories:
-                # Construct source and destination info
                 if provider_label == "bitbucket":
                     repo_path = f"{repo_info.get('workspace')}/{repo_info.get('slug')}"
-                    repo_name = repo_info.get('slug')
                 else:
                     repo_path = f"{repo_info.get('owner')}/{repo_info.get('name')}"
-                    repo_name = repo_info.get('name')
 
                 source_clone_url = source_provider.get_clone_url(repo_info)
                 destination_path = create_gitlab_destination_path(provider_label, repo_path)
                 repo_dir_name = safe_dir_name(destination_path)
                 
-                # Ensure GitLab project exists
                 if not gitlab_destination.ensure_project_exists(destination_path):
                     logger.error(f"Cannot sync to GitLab: project {destination_path} does not exist and could not be created.")
                     continue
