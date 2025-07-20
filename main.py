@@ -7,7 +7,6 @@ import requests
 from datetime import datetime
 import time
 
-# ---- LOGGING SETUP ----
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "sync.log")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -60,31 +59,46 @@ def create_gitlab_destination_path(provider, repo_path):
 def safe_dir_name(path):
     return re.sub(r'[^a-zA-Z0-9_\-]', '-', path)
 
-def run_command(cmd, cwd=None, retries=3, retry_delay=20, timeout=600):
+def log_prefix(provider, repo_idx, repo_total, repo_path, branch, branch_idx, branch_total, status=None, emoji=None):
+    # Example custom: add emoji and sync status
+    em = f"{emoji} " if emoji else ""
+    stat = f"[{status}]" if status else ""
+    parts = [
+        em,
+        f"[{provider.capitalize()} {repo_idx}/{repo_total}]",
+        f"[Repo: {repo_path}]"
+    ]
+    if branch:
+        parts.append(f"[Branch: {branch} {branch_idx}/{branch_total}]")
+    if status:
+        parts.append(stat)
+    return ' '.join(parts)
+
+def run_command(cmd, cwd=None, retries=3, retry_delay=20, timeout=600,
+                log_ctx="", operation_name="", attempt_offset=1):
     display_cmd = [re.sub(r"://[^:]+:[^@]+@", "://<redacted>@", a) if "@" in a else a for a in cmd]
-    attempt = 1
-    while attempt <= retries:
-        logger.info(f"Running (attempt {attempt}/{retries}): {' '.join(display_cmd)}")
+    for attempt in range(attempt_offset, retries + attempt_offset):
+        prefix = log_ctx
+        attempt_str = f"[{attempt}/{retries}]"
+        logger.info(f"{prefix}{attempt_str} {operation_name} {' '.join(display_cmd)}")
         start_time = time.time()
         try:
             result = subprocess.run(
                 cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
             )
             elapsed = time.time() - start_time
-            logger.info(f"Command duration: {elapsed:.2f} seconds")
+            logger.info(f"{prefix}{attempt_str} {operation_name} Command duration: {elapsed:.2f} seconds")
             if result.returncode == 0:
                 return result
             else:
-                logger.error(f"Command failed (attempt {attempt}): {' '.join(display_cmd)} | "
-                             f"Return code: {result.returncode} | Stderr: {result.stderr.decode().strip()}")
+                logger.error(f"{prefix}{attempt_str} {operation_name} Command failed: Return code: {result.returncode} | Stderr: {result.stderr.decode().strip()}")
         except subprocess.TimeoutExpired:
             elapsed = time.time() - start_time
-            logger.error(f"Command timed out (attempt {attempt}): {' '.join(display_cmd)} | Timeout: {timeout}s after {elapsed:.2f}s")
+            logger.error(f"{prefix}{attempt_str} {operation_name} Command timed out: Timeout: {timeout}s after {elapsed:.2f}s")
         except Exception as exc:
-            logger.error(f"Command error (attempt {attempt}): {' '.join(display_cmd)} | Exception: {exc}")
-        attempt += 1
-        if attempt <= retries:
-            logger.info(f"Retrying in {retry_delay} seconds...")
+            logger.error(f"{prefix}{attempt_str} {operation_name} Command error: Exception: {exc}")
+        if attempt < retries + attempt_offset - 1:
+            logger.info(f"{prefix}{attempt_str} Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
     return None
 
@@ -118,7 +132,6 @@ class GitHubSource:
         return repositories
 
     def get_clone_url(self, repo):
-        # Authenticated HTTPS clone URL
         return f"https://{self.username}:{self.access_token}@github.com/{repo['owner']}/{repo['name']}.git"
 
     def fetch_branches(self, repo):
@@ -260,7 +273,8 @@ class GitLabDestination:
             return r.json()["id"]
         return None
 
-def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name, teams_webhook_url=None, provider=None):
+def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
+                teams_webhook_url=None, provider=None, repo_idx=None, repo_total=None, repo_path=None, branch_idx=None, branch_total=None):
     CLONE_RETRIES = 3
     CLONE_DELAY = 30
     CLONE_TIMEOUT = 600
@@ -268,51 +282,79 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
     PUSH_DELAY = 30
     PUSH_TIMEOUT = 600
 
+    prefix = log_prefix(provider, repo_idx, repo_total, repo_path, branch, branch_idx, branch_total)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         repo_dir_path = os.path.join(temp_dir, repo_dir_name)
         try:
             clone_result = run_command(
                 ["git", "clone", "--single-branch", "--branch", branch, source_clone_url, repo_dir_path],
-                cwd=temp_dir, retries=CLONE_RETRIES, retry_delay=CLONE_DELAY, timeout=CLONE_TIMEOUT
+                cwd=temp_dir, retries=CLONE_RETRIES, retry_delay=CLONE_DELAY, timeout=CLONE_TIMEOUT,
+                log_ctx=prefix, operation_name="git clone"
             )
             if not clone_result or clone_result.returncode != 0:
                 stderr = clone_result.stderr.decode() if clone_result else ''
-                msg = (f"Failed to clone branch '{branch}' from {source_clone_url} after {CLONE_RETRIES} attempts. "
+                msg = (f"{prefix} Failed to clone branch '{branch}' from {source_clone_url} after {CLONE_RETRIES} attempts. "
                        f"Last error: {stderr}")
                 logger.error(msg)
                 if teams_webhook_url:
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
-                return
+                return {"status": "failed", "message": msg}
 
-            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path, retries=1)
-            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path, retries=1)
+            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path, retries=1,
+                        log_ctx=prefix, operation_name="git remote remove")
+            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path, retries=1,
+                        log_ctx=prefix, operation_name="git remote add")
 
             push_result = run_command(
                 ["git", "push", "-u", "destination", f"{branch}:{branch}"],
-                cwd=repo_dir_path, retries=PUSH_RETRIES, retry_delay=PUSH_DELAY, timeout=PUSH_TIMEOUT
+                cwd=repo_dir_path, retries=PUSH_RETRIES, retry_delay=PUSH_DELAY, timeout=PUSH_TIMEOUT,
+                log_ctx=prefix, operation_name="git push"
             )
             if not push_result or push_result.returncode != 0:
                 stderr = push_result.stderr.decode() if push_result else ''
-                msg = (f"Failed to push branch '{branch}' to {destination_gitlab_url} after {PUSH_RETRIES} attempts. "
+                msg = (f"{prefix} Failed to push branch '{branch}' to {destination_gitlab_url} after {PUSH_RETRIES} attempts. "
                        f"Last error: {stderr}")
                 logger.error(msg)
                 if teams_webhook_url:
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
+                return {"status": "failed", "message": msg}
             else:
                 stdout = push_result.stdout.decode()
                 stderr = push_result.stderr.decode()
                 if ("Everything up-to-date" not in stdout) and ("Everything up-to-date" not in stderr):
-                    logger.info(f"Branch '{branch}' changes pushed: {source_clone_url} -> {destination_gitlab_url}")
+                    msg = f"{prefix} Branch '{branch}' changes pushed: {source_clone_url} -> {destination_gitlab_url}"
+                    logger.info(msg)
                     if teams_webhook_url:
                         notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, f"Branch '{branch}' changes pushed")
+                    return {"status": "success", "message": msg}
                 else:
-                    logger.info(f"No changes to sync for branch '{branch}' in {source_clone_url}")
+                    msg = f"{prefix} No changes to sync for branch '{branch}' in {source_clone_url}"
+                    logger.info(msg)
+                    return {"status": "success", "message": msg}
 
         except Exception as exc:
-            msg = f"Sync error for branch '{branch}': {exc}"
+            msg = f"{prefix} Sync error for branch '{branch}': {exc}"
             logger.error(msg)
             if teams_webhook_url:
                 notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
+            return {"status": "failed", "message": msg}
+
+def print_summary(sync_results):
+    successes = [r for r in sync_results if r['status'] == 'success']
+    failures = [r for r in sync_results if r['status'] != 'success']
+
+    logger.info("\n=== Sync cycle summary ===")
+    logger.info(f"Total syncs: {len(sync_results)} | Successes: {len(successes)} | Failures: {len(failures)}")
+    if successes:
+        logger.info("Successful syncs:")
+        for res in successes:
+            logger.info(f"[{res['provider']}] [{res['repo']}] [{res['branch']}] OK: {res['message'][:100]}")
+    if failures:
+        logger.error("Failed syncs:")
+        for res in failures:
+            logger.error(f"[{res['provider']}] [{res['repo']}] [{res['branch']}] FAILED: {res['message'][:150]}")
+    logger.info("=========================\n")
 
 def main():
     GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -341,10 +383,12 @@ def main():
 
     while True:
         logger.info("=== Starting full sync cycle ===")
+        sync_results = []
         for provider_label, source_provider in sources:
             logger.info(f"==== Syncing repositories from {provider_label.upper()} ====")
             repositories = source_provider.fetch_all_repositories()
-            for repo_info in repositories:
+            repo_total = len(repositories)
+            for repo_idx, repo_info in enumerate(repositories, start=1):
                 if provider_label == "bitbucket":
                     repo_path = f"{repo_info.get('workspace')}/{repo_info.get('slug')}"
                 else:
@@ -364,11 +408,22 @@ def main():
                     logger.info(f"No branches found for repo {repo_path}. Skipping.")
                     continue
 
-                for branch in branches:
-                    sync_branch(
+                branch_total = len(branches)
+                for branch_idx, branch in enumerate(branches, start=1):
+                    result = sync_branch(
                         source_clone_url, branch, destination_gitlab_url, repo_dir_name,
-                        teams_webhook_url=TEAMS_WEBHOOK_URL, provider=provider_label
+                        teams_webhook_url=TEAMS_WEBHOOK_URL, provider=provider_label,
+                        repo_idx=repo_idx, repo_total=repo_total,
+                        repo_path=repo_path, branch_idx=branch_idx, branch_total=branch_total
                     )
+                    sync_results.append({
+                        "provider": provider_label,
+                        "repo": repo_path,
+                        "branch": branch,
+                        "status": result.get('status', 'unknown'),
+                        "message": result.get('message', '')
+                    })
+        print_summary(sync_results)
         logger.info(f"=== Sync cycle complete. Sleeping {SLEEP_SECONDS} seconds ===")
         time.sleep(SLEEP_SECONDS)
 
