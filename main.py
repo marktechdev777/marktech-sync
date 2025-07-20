@@ -58,17 +58,24 @@ def create_gitlab_destination_path(provider, repo_path):
     provider = provider.lower()
     return f"marktech-sync/{provider}/{path}"
 
+def safe_dir_name(path):
+    return re.sub(r'[^a-zA-Z0-9_\-]', '-', path)
+
 def run_command(cmd, cwd=None):
+    # Redact tokens in any logged URLs
+    display_cmd = [re.sub(r"://[^:]+:[^@]+@", "://<redacted>@", a) if "@" in a else a for a in cmd]
+    logger.info(f"Running: {' '.join(display_cmd)}")
     try:
         result = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         return result
     except Exception as exc:
-        logger.error(f"Command failed: {' '.join(cmd)} | Exception: {exc}")
+        logger.error(f"Command failed: {' '.join(display_cmd)} | Exception: {exc}")
         return None
 
 class GitHubSource:
     def __init__(self, access_token, username):
         self.api_url = "https://api.github.com"
+        self.access_token = access_token
         self.headers = {"Authorization": f"token {access_token}"}
         self.username = username
 
@@ -95,7 +102,8 @@ class GitHubSource:
         return repositories
 
     def get_clone_url(self, repo):
-        return f"https://github.com/{repo['owner']}/{repo['name']}.git"
+        # Authenticated HTTPS clone URL
+        return f"https://{self.username}:{self.access_token}@github.com/{repo['owner']}/{repo['name']}.git"
 
     def fetch_branches(self, repo):
         url = f"{self.api_url}/repos/{repo['owner']}/{repo['name']}/branches"
@@ -138,7 +146,7 @@ class GiteeSource:
         return repositories
 
     def get_clone_url(self, repo):
-        return f"https://gitee.com/{repo['owner']}/{repo['name']}.git"
+        return f"https://{self.username}:{self.access_token}@gitee.com/{repo['owner']}/{repo['name']}.git"
 
     def fetch_branches(self, repo):
         url = f"{self.api_url}/repos/{repo['owner']}/{repo['name']}/branches"
@@ -177,7 +185,7 @@ class BitbucketSource:
         return repositories
 
     def get_clone_url(self, repo):
-        return f"https://bitbucket.org/{repo['workspace']}/{repo['slug']}.git"
+        return f"https://{self.auth[0]}:{self.auth[1]}@bitbucket.org/{repo['workspace']}/{repo['slug']}.git"
 
     def fetch_branches(self, repo):
         url = f"{self.api_url}/repositories/{repo['workspace']}/{repo['slug']}/refs/branches"
@@ -196,15 +204,58 @@ class GitLabDestination:
         self.api_url = "https://gitlab.com/api/v4"
         self.headers = {"PRIVATE-TOKEN": access_token}
         self.username = username
+        self.access_token = access_token
 
     def get_destination_url(self, repo_path):
-        return f"https://gitlab.com/{repo_path}.git"
+        # Authenticated HTTPS URL for push
+        return f"https://{self.username}:{self.access_token}@gitlab.com/{repo_path}.git"
 
-def sync_branch(source_clone_url, branch, destination_gitlab_url, teams_webhook_url=None, provider=None):
+    def ensure_project_exists(self, repo_path):
+        # repo_path: e.g. "marktech-sync/github/user-repo"
+        try:
+            namespace, name = repo_path.rsplit("/", 1)
+            group_id = self.get_group_id(namespace)
+            if not group_id:
+                logger.error(f"GitLab group '{namespace}' not found. Cannot create project '{name}'.")
+                return False
+            # Check if project exists
+            url = f"{self.api_url}/projects/{namespace.replace('/', '%2F')}%2F{name}"
+            r = requests.get(url, headers=self.headers)
+            if r.status_code == 200:
+                return True  # Project exists
+            # Otherwise, create project
+            create_url = f"{self.api_url}/projects"
+            data = {
+                "name": name,
+                "namespace_id": group_id,
+                "path": name,
+                "visibility": "private"
+            }
+            r = requests.post(create_url, headers=self.headers, data=data)
+            if r.status_code == 201:
+                logger.info(f"Created GitLab project {namespace}/{name}")
+                return True
+            logger.error(f"Failed to create GitLab project {namespace}/{name}: {r.status_code} {r.text}")
+            return False
+        except Exception as exc:
+            logger.error(f"Exception while ensuring GitLab project exists: {exc}")
+            return False
+
+    def get_group_id(self, namespace):
+        # namespace: e.g. "marktech-sync/github"
+        url = f"{self.api_url}/groups/{namespace.replace('/', '%2F')}"
+        r = requests.get(url, headers=self.headers)
+        if r.status_code == 200:
+            return r.json()["id"]
+        # Optionally, try to create the group here if not found.
+        return None
+
+def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name, teams_webhook_url=None, provider=None):
     with tempfile.TemporaryDirectory() as temp_dir:
+        repo_dir_path = os.path.join(temp_dir, repo_dir_name)
         try:
             clone_result = run_command([
-                "git", "clone", "--single-branch", "--branch", branch, source_clone_url, "repo"
+                "git", "clone", "--single-branch", "--branch", branch, source_clone_url, repo_dir_path
             ], cwd=temp_dir)
             if not clone_result or clone_result.returncode != 0:
                 msg = f"Failed to clone branch '{branch}' from {source_clone_url} | {clone_result.stderr.decode() if clone_result else ''}"
@@ -213,11 +264,10 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, teams_webhook_
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
                 return
 
-            repo_dir = os.path.join(temp_dir, "repo")
-            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir)
-            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir)
+            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path)
+            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path)
 
-            push_result = run_command(["git", "push", "-u", "destination", f"{branch}:{branch}"], cwd=repo_dir)
+            push_result = run_command(["git", "push", "-u", "destination", f"{branch}:{branch}"], cwd=repo_dir_path)
             if not push_result or push_result.returncode != 0:
                 stderr = push_result.stderr.decode() if push_result else ""
                 msg = f"Failed to push branch '{branch}' to {destination_gitlab_url} | {stderr}"
@@ -250,7 +300,7 @@ def main():
     GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN")
     GITLAB_USERNAME = os.environ.get("GITLAB_USERNAME")
     TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
-    SLEEP_SECONDS = int(os.environ.get("SYNC_INTERVAL", "180"))  # Default: 3 minutes
+    SLEEP_SECONDS = int(os.environ.get("SYNC_INTERVAL", "300"))  # Default: 5 minutes
 
     sources = []
     if GITHUB_TOKEN and GITHUB_USERNAME:
@@ -271,15 +321,32 @@ def main():
             logger.info(f"==== Syncing repositories from {provider_label.upper()} ====")
             repositories = source_provider.fetch_all_repositories()
             for repo_info in repositories:
+                # Construct source and destination info
+                if provider_label == "bitbucket":
+                    repo_path = f"{repo_info.get('workspace')}/{repo_info.get('slug')}"
+                    repo_name = repo_info.get('slug')
+                else:
+                    repo_path = f"{repo_info.get('owner')}/{repo_info.get('name')}"
+                    repo_name = repo_info.get('name')
+
                 source_clone_url = source_provider.get_clone_url(repo_info)
-                repo_path = f"{repo_info.get('owner') or repo_info.get('workspace')}/{repo_info.get('name') or repo_info.get('slug')}"
                 destination_path = create_gitlab_destination_path(provider_label, repo_path)
+                repo_dir_name = safe_dir_name(destination_path)
+                
+                # Ensure GitLab project exists
+                if not gitlab_destination.ensure_project_exists(destination_path):
+                    logger.error(f"Cannot sync to GitLab: project {destination_path} does not exist and could not be created.")
+                    continue
                 destination_gitlab_url = gitlab_destination.get_destination_url(destination_path)
 
                 branches = source_provider.fetch_branches(repo_info)
+                if not branches:
+                    logger.info(f"No branches found for repo {repo_path}. Skipping.")
+                    continue
+
                 for branch in branches:
                     sync_branch(
-                        source_clone_url, branch, destination_gitlab_url,
+                        source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                         teams_webhook_url=TEAMS_WEBHOOK_URL, provider=provider_label
                     )
         logger.info(f"=== Sync cycle complete. Sleeping {SLEEP_SECONDS} seconds ===")
