@@ -340,7 +340,7 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                         log_ctx=prefix, operation_name="git remote add")
 
             push_result = run_command(
-                ["git", "push", "-u", "destination", f"{branch}:{branch}"],
+                ["git", "push", "-u", "--force", "destination", f"{branch}:{branch}"],
                 cwd=repo_dir_path, retries=PUSH_RETRIES, retry_delay=PUSH_DELAY, timeout=PUSH_TIMEOUT,
                 log_ctx=prefix, operation_name="git push"
             )
