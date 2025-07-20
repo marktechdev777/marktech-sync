@@ -60,7 +60,6 @@ def safe_dir_name(path):
     return re.sub(r'[^a-zA-Z0-9_\-]', '-', path)
 
 def log_prefix(provider, repo_idx, repo_total, repo_path, branch, branch_idx, branch_total, status=None, emoji=None):
-    # Example custom: add emoji and sync status
     em = f"{emoji} " if emoji else ""
     stat = f"[{status}]" if status else ""
     parts = [
@@ -101,6 +100,28 @@ def run_command(cmd, cwd=None, retries=3, retry_delay=20, timeout=600,
             logger.info(f"{prefix}{attempt_str} Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
     return None
+
+def rewrite_authors(repo_dir, new_name, new_email, logger, log_ctx=""):
+    logger.info(f"{log_ctx} Rewriting authorship: {new_name} <{new_email}> for all commits in {repo_dir}")
+    env = os.environ.copy()
+    env["GIT_COMMITTER_NAME"] = new_name
+    env["GIT_COMMITTER_EMAIL"] = new_email
+    cmd = [
+        "git", "filter-branch", "--force", "--env-filter",
+        f"""
+        export GIT_AUTHOR_NAME='{new_name}';
+        export GIT_AUTHOR_EMAIL='{new_email}';
+        export GIT_COMMITTER_NAME='{new_name}';
+        export GIT_COMMITTER_EMAIL='{new_email}';
+        """,
+        "--tag-name-filter", "cat", "--", "--all"
+    ]
+    result = subprocess.run(cmd, cwd=repo_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+    if result.returncode == 0:
+        logger.info(f"{log_ctx} Successfully rewrote authorship in {repo_dir}")
+    else:
+        logger.error(f"{log_ctx} Author rewrite failed: {result.stderr.decode().strip()}")
+    return result.returncode == 0
 
 class GitHubSource:
     def __init__(self, access_token, username):
@@ -300,6 +321,16 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                 if teams_webhook_url:
                     notify_teams_sync(teams_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
                 return {"status": "failed", "message": msg}
+
+            # --- AUTHOR REWRITE, if set ---
+            DEST_AUTHOR_NAME = os.environ.get("DEST_AUTHOR_NAME")
+            DEST_AUTHOR_EMAIL = os.environ.get("DEST_AUTHOR_EMAIL")
+            if DEST_AUTHOR_NAME and DEST_AUTHOR_EMAIL:
+                success = rewrite_authors(repo_dir_path, DEST_AUTHOR_NAME, DEST_AUTHOR_EMAIL, logger, log_ctx=prefix)
+                if not success:
+                    msg = f"{prefix} Author rewrite failed for branch '{branch}' in {repo_dir_path}."
+                    logger.error(msg)
+                    return {"status": "failed", "message": msg}
 
             run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path, retries=1,
                         log_ctx=prefix, operation_name="git remote remove")
