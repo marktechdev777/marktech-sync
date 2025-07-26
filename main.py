@@ -313,7 +313,6 @@ class GiteeSource:
     def __init__(self, access_token, username, session=None):
         self.api_url = "https://gitee.com/api/v5"
         self.access_token = access_token
-        the
         self.username = username
         self.session = session or SESSION
 
@@ -683,7 +682,8 @@ def sync_single_repo_task(task):
             break
         result = sync_branch(
             source_clone_url, branch, destination_gitlab_url, repo_dir_name,
-            slack_webhook_url=SLACK_WEBHOOK_URL, provider=provider_label,
+            slack_webhook_url=None,  # per-branch Slack optional; summary is always sent
+            provider=provider_label,
             repo_idx=repo_idx, repo_total=repo_total,
             repo_path=repo_path, branch_idx=branch_idx, branch_total=branch_total,
             dest_author_name=DEST_AUTHOR_NAME, dest_author_email=DEST_AUTHOR_EMAIL, job=jid
