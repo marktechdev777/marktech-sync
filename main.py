@@ -6,7 +6,7 @@ import logging
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import threading
 import queue
@@ -129,7 +129,7 @@ def _slack_post(webhook_url, payload):
 
 def notify_slack_sync(webhook_url, provider, source_repo_url, destination_repo_url, message, error=False):
     status_emoji = ":x:" if error else ":white_check_mark:"
-    now = datetime.utcnow().isoformat() + " UTC"
+    now = datetime.now(timezone.utc).isoformat() + " UTC"
     payload = {
         "blocks": [
             {"type": "header", "text": {"type": "plain_text", "text": f"{status_emoji} Repository Sync {'FAILED' if error else 'Completed'}"}},
@@ -233,7 +233,7 @@ def run_command(cmd, cwd=None, retries=3, base_delay=5, max_delay=BACKOFF_MAX, t
 # Author rewrite (filter-branch; consider filter-repo for speed)
 # =========================
 def rewrite_authors(repo_dir, new_name, new_email, logger, log_ctx=""):
-    logger.info(f"{log_ctx} Rewriting authorship: {new_name} <{new_email}> for all commits in {repo_dir}")
+    # logger.info(f"{log_ctx} Rewriting authorship: {new_name} <{new_email}> for all commits in {repo_dir}")
     env = os.environ.copy()
     env["GIT_AUTHOR_NAME"] = new_name
     env["GIT_AUTHOR_EMAIL"] = new_email
@@ -245,9 +245,11 @@ def rewrite_authors(repo_dir, new_name, new_email, logger, log_ctx=""):
     ]
     result = subprocess.run(cmd, cwd=repo_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
     if result.returncode == 0:
-        logger.info(f"{log_ctx} Successfully rewrote authorship in {repo_dir}")
+        pass
+        # logger.info(f"{log_ctx} Successfully rewrote authorship in {repo_dir}")
     else:
-        logger.error(f"{log_ctx} Author rewrite failed: {scrub_text(result.stderr.decode(errors='replace').strip())}")
+        pass
+        # logger.error(f"{log_ctx} Author rewrite failed: {scrub_text(result.stderr.decode(errors='replace').strip())}")
     return result.returncode == 0
 
 # =========================
@@ -749,7 +751,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     while not stop_event.is_set():
-        cycle_start = datetime.utcnow().isoformat()
+        cycle_start = datetime.now(timezone.utc).isoformat()
         results = []
         lock = threading.Lock()
         threads = []
