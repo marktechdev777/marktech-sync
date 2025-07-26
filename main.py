@@ -233,7 +233,7 @@ def run_command(cmd, cwd=None, retries=3, base_delay=5, max_delay=BACKOFF_MAX, t
 # Author rewrite (filter-branch; consider filter-repo for speed)
 # =========================
 def rewrite_authors(repo_dir, new_name, new_email, logger, log_ctx=""):
-    # logger.info(f"{log_ctx} Rewriting authorship: {new_name} <{new_email}> for all commits in {repo_dir}")
+    logger.info(f"{log_ctx} Rewriting authorship: {new_name} <{new_email}> for all commits in {repo_dir}")
     env = os.environ.copy()
     env["GIT_AUTHOR_NAME"] = new_name
     env["GIT_AUTHOR_EMAIL"] = new_email
@@ -245,11 +245,9 @@ def rewrite_authors(repo_dir, new_name, new_email, logger, log_ctx=""):
     ]
     result = subprocess.run(cmd, cwd=repo_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
     if result.returncode == 0:
-        pass
-        # logger.info(f"{log_ctx} Successfully rewrote authorship in {repo_dir}")
+        logger.info(f"{log_ctx} Successfully rewrote authorship in {repo_dir}")
     else:
-        pass
-        # logger.error(f"{log_ctx} Author rewrite failed: {scrub_text(result.stderr.decode(errors='replace').strip())}")
+        logger.error(f"{log_ctx} Author rewrite failed: {scrub_text(result.stderr.decode(errors='replace').strip())}")
     return result.returncode == 0
 
 # =========================
@@ -315,6 +313,7 @@ class GiteeSource:
     def __init__(self, access_token, username, session=None):
         self.api_url = "https://gitee.com/api/v5"
         self.access_token = access_token
+        the
         self.username = username
         self.session = session or SESSION
 
@@ -592,8 +591,6 @@ def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                 if ("Everything up-to-date" not in stdout) and ("Everything up-to-date" not in stderr):
                     msg = f"Branch '{branch}' changes pushed: {sanitize_url(source_clone_url)} -> {sanitize_url(destination_gitlab_url)}"
                     human_log(f"Sync \"{display_repo}\" on \"{branch}\" branch completed!", provider=prov, job=job, level="info")
-                    if slack_webhook_url:
-                        notify_slack_sync(slack_webhook_url, provider, source_clone_url, destination_gitlab_url, f"Branch '{branch}' changes pushed")
                     return {"status": "success", "message": msg}
                 else:
                     msg = f"No changes to sync for branch '{branch}' in {sanitize_url(source_clone_url)}"
@@ -765,6 +762,21 @@ def main():
                 repo_total = len(repositories)
                 human_log(f"{PROVIDER_NAME.get(provider_label, provider_label.capitalize())}: Found {repo_total} repositories.")
                 for repo_idx, repo_info in enumerate(repositories, start=1):
+                    # Skip Bitbucket repos whose slug starts with "archived-"
+                    if provider_label == "bitbucket":
+                        slug = str(repo_info.get("slug", ""))
+                        workspace = str(repo_info.get("workspace", ""))
+                        repo_path_for_skip = f"{workspace}/{slug}" if workspace and slug else slug
+                        if slug.lower().startswith("archived-"):
+                            jid = job_id(provider_label, repo_path_for_skip or slug)
+                            human_log(
+                                f"Repository \"{repo_path_for_skip}\" is archived (slug starts with 'archived-'). Skipping.",
+                                provider="Bitbucket",
+                                job=jid,
+                                level="info",
+                            )
+                            continue
+
                     work_q.put({
                         "provider_label": provider_label,
                         "source_provider": source_provider,
