@@ -415,7 +415,7 @@ class GitLabDestination:
         self.api_url = "https://gitlab.com/api/v4"
         self.headers = {"PRIVATE-TOKEN": access_token}
         self.username = username
-               self.access_token = access_token
+        self.access_token = access_token
         self.session = session or SESSION
 
     def get_destination_url(self, repo_path):
