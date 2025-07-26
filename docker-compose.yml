@@ -17,10 +17,10 @@ services:
       - BITBUCKET_USERNAME
       - GITLAB_TOKEN
       - GITLAB_USERNAME
-      - SLACK_WEBHOOK_URL
+      - MARKTECH_SYNC_URL
       - DEST_AUTHOR_NAME
       - DEST_AUTHOR_EMAIL
-      - MARKTECH_SYNC_URL
+      - SLACK_WEBHOOK_URL
     command:
       - /bin/bash
       - -c

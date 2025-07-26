@@ -12,6 +12,8 @@ import threading
 import queue
 import signal
 import random
+import hashlib
+from typing import Optional
 from urllib.parse import urlsplit, urlunsplit, quote
 
 # =========================
@@ -21,9 +23,10 @@ LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "sync.log")
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# We print fully-formatted human messages ourselves:
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    format="%(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
 )
 logger = logging.getLogger("MarktechSync")
@@ -81,6 +84,33 @@ def scrub_text(s: str) -> str:
 def redact_cmd_args(args):
     # Redact credentials in displayed command
     return [re.sub(r"://[^:]+:[^@]+@", "://<redacted>@", a) if isinstance(a, str) and "@" in a else a for a in args]
+
+def oneline(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    return re.sub(r"\s+", " ", s).strip()
+
+# =========================
+# Human log line helpers
+# =========================
+PROVIDER_NAME = {"github": "GitHub", "gitee": "Gitee", "bitbucket": "Bitbucket"}
+
+def _thread_tag():
+    name = threading.current_thread().name
+    if name.startswith("worker-"):
+        n = name.split("-", 1)[1]
+        return f"worker: {n.zfill(2)}"
+    return "main      "
+
+def job_id(provider: str, repo_path: str) -> str:
+    return hashlib.sha1(f"{provider}:{repo_path}".encode()).hexdigest()[:8]
+
+def human_log(message: str, provider: Optional[str] = None, job: str = "--------", level: str = "info"):
+    parts = [f"[MarktechSync] [{_thread_tag():<10}] [job: {job}]"]
+    if provider:
+        parts.append(f"[{provider}]")
+    line = " ".join(parts) + f" {message}"
+    getattr(logger, level)(line)
 
 # =========================
 # Slack notifications
@@ -158,18 +188,8 @@ def create_gitlab_destination_path(provider, repo_path):
 def safe_dir_name(path):
     return re.sub(r"[^a-zA-Z0-9_\-]", "-", path)
 
-def log_prefix(provider, repo_idx, repo_total, repo_path, branch, branch_idx, branch_total, status=None, emoji=None):
-    em = f"{emoji} " if emoji else ""
-    stat = f"[{status}]" if status else ""
-    parts = [em, f"[{provider.capitalize()} {repo_idx}/{repo_total}]", f"[Repo: {repo_path}]"]
-    if branch:
-        parts.append(f"[Branch: {branch} {branch_idx}/{branch_total}]")
-    if status:
-        parts.append(stat)
-    return " ".join(parts)
-
 # =========================
-# Commands with backoff & jitter
+# Commands with backoff & (optional) silent logging
 # =========================
 def _sleep_with_jitter(seconds):
     end = time.time() + seconds
@@ -177,35 +197,35 @@ def _sleep_with_jitter(seconds):
         time.sleep(min(0.1, end - time.time()))
 
 def run_command(cmd, cwd=None, retries=3, base_delay=5, max_delay=BACKOFF_MAX, timeout=600,
-                log_ctx="", operation_name="", attempt_offset=1, env=None):
-    display_cmd = redact_cmd_args(cmd)
+                log_ctx="", operation_name="", attempt_offset=1, env=None, silent=False):
+    display_cmd = redact_cmd_args(cmd)  # only used if not silent
     for attempt in range(attempt_offset, retries + attempt_offset):
-        prefix = log_ctx
-        attempt_str = f"[{attempt}/{retries}]"
-        logger.info(f"{prefix}{attempt_str} {operation_name} {' '.join(display_cmd)}")
         start_time = time.time()
         try:
             result = subprocess.run(
                 cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
             )
             elapsed = time.time() - start_time
-            logger.info(f"{prefix}{attempt_str} {operation_name} Command duration: {elapsed:.2f} seconds")
             if result.returncode == 0:
                 return result
             else:
-                stderr = scrub_text(result.stderr.decode(errors="replace").strip())
-                logger.error(f"{prefix}{attempt_str} {operation_name} Command failed: Return code: {result.returncode} | Stderr: {stderr}")
+                if not silent:
+                    stderr = oneline(scrub_text(result.stderr.decode(errors="replace").strip()))
+                    logger.error(f"{operation_name} failed (rc={result.returncode}) in {elapsed:.2f}s | Cmd: {' '.join(display_cmd)} | Stderr: {stderr}")
         except subprocess.TimeoutExpired:
             elapsed = time.time() - start_time
-            logger.error(f"{prefix}{attempt_str} {operation_name} Command timed out: Timeout: {timeout}s after {elapsed:.2f}s")
+            if not silent:
+                logger.error(f"{operation_name} timed out after {elapsed:.2f}s (timeout={timeout}s) | Cmd: {' '.join(display_cmd)}")
         except Exception as exc:
-            logger.error(f"{prefix}{attempt_str} {operation_name} Command error: Exception: {exc}")
+            if not silent:
+                logger.error(f"{operation_name} error: {exc} | Cmd: {' '.join(display_cmd)}")
 
         # backoff with randomized jitter
         if attempt < retries + attempt_offset - 1 and not stop_event.is_set():
             delay = min(max_delay, base_delay * (BACKOFF_BASE ** (attempt - attempt_offset)))
             delay += random.uniform(0, BACKOFF_JITTER)
-            logger.info(f"{prefix}{attempt_str} Retrying in {delay:.2f} seconds...")
+            if not silent:
+                logger.info(f"Retrying in {delay:.2f} seconds... | Cmd: {' '.join(display_cmd)}")
             _sleep_with_jitter(delay)
     return None
 
@@ -265,7 +285,6 @@ class GitHubSource:
             except Exception as exc:
                 logger.error(f"GitHub fetch error: {exc}")
                 break
-        logger.info(f"GitHub: Found {len(repositories)} repositories.")
         return repositories
 
     def get_clone_url(self, repo):
@@ -320,7 +339,6 @@ class GiteeSource:
             except Exception as exc:
                 logger.error(f"Gitee fetch error: {exc}")
                 break
-        logger.info(f"Gitee: Found {len(repositories)} repositories.")
         return repositories
 
     def get_clone_url(self, repo):
@@ -367,7 +385,6 @@ class BitbucketSource:
             except Exception as exc:
                 logger.error(f"Bitbucket fetch error: {exc}")
                 break
-        logger.info(f"Bitbucket: Found {len(repositories)} repositories.")
         return repositories
 
     def get_clone_url(self, repo):
@@ -398,7 +415,7 @@ class GitLabDestination:
         self.api_url = "https://gitlab.com/api/v4"
         self.headers = {"PRIVATE-TOKEN": access_token}
         self.username = username
-        self.access_token = access_token
+               self.access_token = access_token
         self.session = session or SESSION
 
     def get_destination_url(self, repo_path):
@@ -458,7 +475,7 @@ class GitLabDestination:
             data = {"name": name, "namespace_id": group_id, "path": name, "visibility": "private"}
             r = self.session.post(create_url, headers=self.headers, data=data, timeout=REQUEST_TIMEOUT)
             if r.status_code == 201:
-                logger.info(f"Created GitLab project {namespace}/{name}")
+                human_log(f"Created GitLab project {namespace}/{name}")
                 return True
             logger.error(f"Failed to create GitLab project {namespace}/{name}: {r.status_code} {r.text}")
             return False
@@ -466,95 +483,144 @@ class GitLabDestination:
             logger.error(f"Exception while ensuring GitLab project exists: {exc}")
             return False
 
+    def count_projects_in_group(self, full_path: str) -> int:
+        """Counts projects under a group (including subgroups)."""
+        g = self.get_group(full_path)
+        if not g:
+            return 0
+        gid = g["id"]
+        total = 0
+        page = 1
+        while True:
+            r = self.session.get(
+                f"{self.api_url}/groups/{gid}/projects",
+                headers=self.headers,
+                params={"per_page": 100, "page": page, "include_subgroups": "true", "simple": "true"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            if not data:
+                break
+            total += len(data)
+            page += 1
+        return total
+
 # =========================
 # Sync functions
 # =========================
 def sync_branch(source_clone_url, branch, destination_gitlab_url, repo_dir_name,
                 slack_webhook_url=None, provider=None, repo_idx=None, repo_total=None, repo_path=None, branch_idx=None, branch_total=None,
-                dest_author_name=None, dest_author_email=None):
+                dest_author_name=None, dest_author_email=None, job=None):
     CLONE_RETRIES = 3
     PUSH_RETRIES = 3
     CLONE_TIMEOUT = 600
     PUSH_TIMEOUT = 600
 
-    prefix = log_prefix(provider, repo_idx, repo_total, repo_path, branch, branch_idx, branch_total)
+    prov = PROVIDER_NAME.get(provider, (provider or "").capitalize())
+    display_repo = repo_path
 
     with tempfile.TemporaryDirectory() as temp_dir:
         repo_dir_path = os.path.join(temp_dir, repo_dir_name)
         try:
-            clone_result = run_command(
-                ["git", "clone", "--single-branch", "--branch", branch, source_clone_url, repo_dir_path],
-                cwd=temp_dir, retries=CLONE_RETRIES, base_delay=5, timeout=CLONE_TIMEOUT,
-                log_ctx=prefix, operation_name="git clone"
-            )
-            if not clone_result or clone_result.returncode != 0:
-                stderr = scrub_text(clone_result.stderr.decode(errors="replace") if clone_result else "")
-                msg = (f"{prefix} Failed to clone branch '{branch}' from {sanitize_url(source_clone_url)} after {CLONE_RETRIES} attempts. "
-                       f"Last error: {stderr}")
-                logger.error(msg)
-                if slack_webhook_url:
-                    notify_slack_sync(slack_webhook_url, provider, source_clone_url, destination_gitlab_url, msg, error=True)
+            # --- Clone with our own retry loop (silent command runner)
+            last_err = ""
+            ok = False
+            for attempt in range(1, CLONE_RETRIES + 1):
+                res = run_command(
+                    ["git", "clone", "--single-branch", "--branch", branch, source_clone_url, repo_dir_path],
+                    cwd=temp_dir, retries=1, base_delay=5, timeout=CLONE_TIMEOUT, silent=True,
+                    operation_name="git clone"
+                )
+                if res and res.returncode == 0:
+                    ok = True
+                    break
+                last_err = oneline(scrub_text(res.stderr.decode(errors="replace") if res else ""))
+                human_log(f"Sync \"{display_repo}\" on branch \"{branch}\" failed! (attempt {attempt}/{CLONE_RETRIES})",
+                          provider=prov, job=job, level="error")
+                if last_err:
+                    human_log(f"Error: {last_err}", provider=prov, job=job, level="error")
+                if attempt < CLONE_RETRIES:
+                    _sleep_with_jitter(5 * (2 ** (attempt - 1)))
+            if not ok:
+                msg = f"Clone failed for '{branch}' from {sanitize_url(source_clone_url)} after {CLONE_RETRIES} attempts. Last error: {last_err}"
                 return {"status": "failed", "message": msg}
 
             if dest_author_name and dest_author_email:
-                success = rewrite_authors(repo_dir_path, dest_author_name, dest_author_email, logger, log_ctx=prefix)
+                success = rewrite_authors(repo_dir_path, dest_author_name, dest_author_email, logger, log_ctx="")
                 if not success:
-                    msg = f"{prefix} Author rewrite failed for branch '{branch}' in {repo_dir_path}."
-                    logger.error(msg)
+                    msg = f"Author rewrite failed for branch '{branch}' in {repo_dir_path}."
+                    human_log(f"Sync \"{display_repo}\" on branch \"{branch}\" failed!", provider=prov, job=job, level="error")
+                    human_log(f"Error: {oneline(scrub_text(msg))}", provider=prov, job=job, level="error")
                     return {"status": "failed", "message": msg}
 
-            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path, retries=1,
-                        log_ctx=prefix, operation_name="git remote remove")
-            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path, retries=1,
-                        log_ctx=prefix, operation_name="git remote add")
+            # Set destination remote (silent)
+            run_command(["git", "remote", "remove", "destination"], cwd=repo_dir_path, retries=1, silent=True,
+                        operation_name="git remote remove")
+            run_command(["git", "remote", "add", "destination", destination_gitlab_url], cwd=repo_dir_path, retries=1, silent=True,
+                        operation_name="git remote add")
 
-            push_result = run_command(
-                ["git", "push", "-u", "--force", "destination", f"{branch}:{branch}"],
-                cwd=repo_dir_path, retries=PUSH_RETRIES, base_delay=5, timeout=PUSH_TIMEOUT,
-                log_ctx=prefix, operation_name="git push"
-            )
-            if not push_result or push_result.returncode != 0:
-                stderr = scrub_text(push_result.stderr.decode(errors="replace") if push_result else "")
-                msg = (f"{prefix} Failed to push branch '{branch}' to {sanitize_url(destination_gitlab_url)} after {PUSH_RETRIES} attempts. "
-                       f"Last error: {stderr}")
-                logger.error(msg)
-                # Failures summarized in cycle summary to reduce noise
+            # --- Push with our own retry loop
+            push_result = None
+            last_err = ""
+            for attempt in range(1, PUSH_RETRIES + 1):
+                res = run_command(
+                    ["git", "push", "-u", "--force", "destination", f"{branch}:{branch}"],
+                    cwd=repo_dir_path, retries=1, base_delay=5, timeout=PUSH_TIMEOUT, silent=True,
+                    operation_name="git push"
+                )
+                if res and res.returncode == 0:
+                    push_result = res
+                    break
+                last_err = oneline(scrub_text(res.stderr.decode(errors="replace") if res else ""))
+                human_log(f"Sync \"{display_repo}\" on branch \"{branch}\" failed! (attempt {attempt}/{PUSH_RETRIES})",
+                          provider=prov, job=job, level="error")
+                if last_err:
+                    human_log(f"Error: {last_err}", provider=prov, job=job, level="error")
+                if attempt < PUSH_RETRIES:
+                    _sleep_with_jitter(5 * (2 ** (attempt - 1)))
+            if not push_result:
+                msg = (f"Failed to push branch '{branch}' to {sanitize_url(destination_gitlab_url)} after {PUSH_RETRIES} attempts. "
+                       f"Last error: {last_err}")
                 return {"status": "failed", "message": msg}
             else:
                 stdout = push_result.stdout.decode(errors="replace")
                 stderr = push_result.stderr.decode(errors="replace")
                 if ("Everything up-to-date" not in stdout) and ("Everything up-to-date" not in stderr):
-                    msg = f"{prefix} Branch '{branch}' changes pushed: {sanitize_url(source_clone_url)} -> {sanitize_url(destination_gitlab_url)}"
-                    logger.info(msg)
-                    # Optional per-branch success ping:
+                    msg = f"Branch '{branch}' changes pushed: {sanitize_url(source_clone_url)} -> {sanitize_url(destination_gitlab_url)}"
+                    human_log(f"Sync \"{display_repo}\" on \"{branch}\" branch completed!", provider=prov, job=job, level="info")
                     if slack_webhook_url:
                         notify_slack_sync(slack_webhook_url, provider, source_clone_url, destination_gitlab_url, f"Branch '{branch}' changes pushed")
                     return {"status": "success", "message": msg}
                 else:
-                    msg = f"{prefix} No changes to sync for branch '{branch}' in {sanitize_url(source_clone_url)}"
-                    logger.info(msg)
+                    msg = f"No changes to sync for branch '{branch}' in {sanitize_url(source_clone_url)}"
+                    human_log(f"No changes found of \"{display_repo}\" on \"{branch}\" branch. Skipping.", provider=prov, job=job, level="info")
                     return {"status": "success", "message": msg}
 
         except Exception as exc:
-            msg = f"{prefix} Sync error for branch '{branch}': {exc}"
-            logger.error(msg)
+            msg = f"Sync error for branch '{branch}': {exc}"
+            human_log(f"Sync \"{display_repo}\" on branch \"{branch}\" failed!", provider=prov, job=job, level="error")
+            human_log(f"Error: {oneline(scrub_text(str(exc)))}", provider=prov, job=job, level="error")
             return {"status": "failed", "message": msg}
 
 def print_summary(sync_results):
     successes = [r for r in sync_results if r['status'] == 'success']
     failures = [r for r in sync_results if r['status'] != 'success']
 
-    logger.info("\n=== Sync cycle summary ===")
-    logger.info(f"Total syncs: {len(sync_results)} | Successes: {len(successes)} | Failures: {len(failures)}")
+    human_log("=== Sync cycle summary ===")
+    human_log(f"Total syncs: {len(sync_results)} | Successes: {len(successes)} | Failures: {len(failures)}")
+    human_log("=========================")
     if successes:
-        logger.info("Successful syncs:")
+        human_log("Successful syncs:")
         for res in successes[:25]:
-            logger.info(f"[{res['provider']}] [{res['repo']}] [{res['branch']}] OK: {scrub_text(res['message'])[:100]}")
+            human_log(f"[{res['provider']}] [{res['repo']}] [{res['branch']}] OK: {scrub_text(res['message'])[:100]}")
+        human_log("=========================")
     if failures:
-        logger.error("Failed syncs:")
+        human_log("Failed syncs:")
         for res in failures[:50]:
-            logger.error(f"[{res['provider']}] [{res['repo']}] [{res['branch']}] FAILED: {scrub_text(res['message'])[:150]}")
-    logger.info("=========================\n")
+            human_log(f"[{res['provider']}] [{res['repo']}] [{res['branch']}] FAILED: {scrub_text(res['message'])[:150]}")
+        human_log("=========================")
 
 # =========================
 # Concurrent per-repo worker
@@ -586,14 +652,16 @@ def sync_single_repo_task(task):
     else:
         repo_path = f"{repo_info.get('owner')}/{repo_info.get('name')}"
 
+    jid = job_id(provider_label, repo_path)
+    prov = PROVIDER_NAME.get(provider_label, provider_label.capitalize())
     source_clone_url = source_provider.get_clone_url(repo_info)
     destination_path = create_gitlab_destination_path(provider_label, repo_path)
     repo_dir_name = safe_dir_name(destination_path)
 
     # Ensure destination project
     if not gitlab_destination.ensure_project_exists(destination_path):
-        msg = f"[{provider_label.upper()} {repo_idx}/{repo_total}] [Repo: {repo_path}] Cannot sync: project {destination_path} missing and could not be created."
-        logger.error(msg)
+        msg = f"Cannot sync: project {destination_path} missing and could not be created."
+        human_log(f"{msg}", provider=prov, job=jid, level="error")
         with lock:
             results.append({
                 "provider": provider_label, "repo": repo_path, "branch": "-", "status": "failed", "message": msg
@@ -605,7 +673,7 @@ def sync_single_repo_task(task):
     # Fetch branches (with pagination)
     branches = source_provider.fetch_branches(repo_info)
     if not branches:
-        logger.info(f"[{provider_label.upper()} {repo_idx}/{repo_total}] [Repo: {repo_path}] No branches found. Skipping.")
+        human_log(f"No branches found of \"{repo_path}\". Skipping.", provider=prov, job=jid, level="info")
         with lock:
             results.append({"provider": provider_label, "repo": repo_path, "branch": "-", "status": "success", "message": "No branches; skipped"})
         return
@@ -619,7 +687,7 @@ def sync_single_repo_task(task):
             slack_webhook_url=SLACK_WEBHOOK_URL, provider=provider_label,
             repo_idx=repo_idx, repo_total=repo_total,
             repo_path=repo_path, branch_idx=branch_idx, branch_total=branch_total,
-            dest_author_name=DEST_AUTHOR_NAME, dest_author_email=DEST_AUTHOR_EMAIL
+            dest_author_name=DEST_AUTHOR_NAME, dest_author_email=DEST_AUTHOR_EMAIL, job=jid
         )
         with lock:
             results.append({
@@ -643,8 +711,11 @@ def main():
     BITBUCKET_USERNAME = os.environ.get("BITBUCKET_USERNAME")
     GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN")
     GITLAB_USERNAME = os.environ.get("GITLAB_USERNAME")
-    SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-    SLEEP_SECONDS = int(os.environ.get("SYNC_INTERVAL", "300"))
+    # Prefer Slack; fallback to TEAMS for backward compatibility if Slack not set
+    SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL") or os.environ.get("TEAMS_WEBHOOK_URL")
+    if os.environ.get("TEAMS_WEBHOOK_URL") and not os.environ.get("SLACK_WEBHOOK_URL"):
+        human_log("Using TEAMS_WEBHOOK_URL as fallback for Slack webhooks.")
+    SLEEP_SECONDS = int(os.environ.get("SYNC_INTERVAL", "300"))  # Default: 5 minutes
     DEST_AUTHOR_NAME = os.environ.get("DEST_AUTHOR_NAME")
     DEST_AUTHOR_EMAIL = os.environ.get("DEST_AUTHOR_EMAIL")
 
@@ -664,87 +735,119 @@ def main():
         logger.error("No source providers configured! Set credentials for at least one of: GitHub, Gitee, Bitbucket.")
         return
 
-    logger.info("Configured providers: " + ", ".join(lbl for lbl, _ in sources))
+    human_log("Configured providers: " + ", ".join(lbl for lbl, _ in sources))
     if DEST_AUTHOR_NAME and DEST_AUTHOR_EMAIL:
-        logger.info(f"Commit author rewrite enabled: {DEST_AUTHOR_NAME} <{DEST_AUTHOR_EMAIL}>")
+        human_log(f"Commit author rewrite enabled: {DEST_AUTHOR_NAME} <{DEST_AUTHOR_EMAIL}>")
 
     gitlab_destination = GitLabDestination(GITLAB_TOKEN, GITLAB_USERNAME, SESSION)
 
     # Graceful shutdown
     def handle_signal(sig, frame):
-        logger.info(f"Received signal {sig}. Stopping after current operations...")
+        human_log(f"Received signal {sig}. Stopping after current operations...")
         stop_event.set()
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     while not stop_event.is_set():
         cycle_start = datetime.utcnow().isoformat()
-        logger.info("=== Starting full sync cycle ===")
         results = []
         lock = threading.Lock()
-
-        work_q = queue.Queue()
-
-        # Enqueue per-repo tasks
-        for provider_label, source_provider in sources:
-            logger.info(f"==== Syncing repositories from {provider_label.upper()} ====")
-            repositories = source_provider.fetch_all_repositories()
-            repo_total = len(repositories)
-            for repo_idx, repo_info in enumerate(repositories, start=1):
-                work_q.put({
-                    "provider_label": provider_label,
-                    "source_provider": source_provider,
-                    "repo_info": repo_info,
-                    "repo_idx": repo_idx,
-                    "repo_total": repo_total,
-                    "gitlab_destination": gitlab_destination,
-                    "SLACK_WEBHOOK_URL": SLACK_WEBHOOK_URL,
-                    "DEST_AUTHOR_NAME": DEST_AUTHOR_NAME,
-                    "DEST_AUTHOR_EMAIL": DEST_AUTHOR_EMAIL,
-                    "results": results,
-                    "lock": lock,
-                })
-
-        # Start worker threads (bounded concurrency)
         threads = []
-        worker_count = min(MAX_WORKERS, work_q.qsize() or 1)
+        try:
+            human_log("=== Starting full sync cycle ===")
+            work_q = queue.Queue()
 
-        def worker():
+            # Enqueue per-repo tasks
+            for provider_label, source_provider in sources:
+                repositories = source_provider.fetch_all_repositories()
+                repo_total = len(repositories)
+                human_log(f"{PROVIDER_NAME.get(provider_label, provider_label.capitalize())}: Found {repo_total} repositories.")
+                for repo_idx, repo_info in enumerate(repositories, start=1):
+                    work_q.put({
+                        "provider_label": provider_label,
+                        "source_provider": source_provider,
+                        "repo_info": repo_info,
+                        "repo_idx": repo_idx,
+                        "repo_total": repo_total,
+                        "gitlab_destination": gitlab_destination,
+                        "SLACK_WEBHOOK_URL": SLACK_WEBHOOK_URL,
+                        "DEST_AUTHOR_NAME": DEST_AUTHOR_NAME,
+                        "DEST_AUTHOR_EMAIL": DEST_AUTHOR_EMAIL,
+                        "results": results,
+                        "lock": lock,
+                    })
+
+            # Start worker threads (bounded concurrency)
+            worker_count = min(MAX_WORKERS, work_q.qsize() or 1)
+
+            def worker():
+                while not stop_event.is_set():
+                    try:
+                        task = work_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        sync_single_repo_task(task)
+                    except Exception as exc:
+                        # Robustly skip this repo and keep the worker alive
+                        try:
+                            provider_label = task.get("provider_label")
+                            repo_info = task.get("repo_info", {})
+                            if provider_label == "bitbucket":
+                                repo_path = f"{repo_info.get('workspace')}/{repo_info.get('slug')}"
+                            else:
+                                repo_path = f"{repo_info.get('owner')}/{repo_info.get('name')}"
+                            jid = job_id(provider_label, repo_path)
+                            prov = PROVIDER_NAME.get(provider_label, provider_label.capitalize())
+                            human_log(f"Unexpected error while syncing \"{repo_path}\". Skipping.", provider=prov, job=jid, level="error")
+                            human_log(f"Error: {oneline(scrub_text(str(exc)))}", provider=prov, job=jid, level="error")
+                            with task["lock"]:
+                                task["results"].append({
+                                    "provider": provider_label,
+                                    "repo": repo_path,
+                                    "branch": "-",
+                                    "status": "failed",
+                                    "message": f"Unhandled error: {oneline(scrub_text(str(exc)))}",
+                                })
+                        except Exception:
+                            logger.exception("Worker error (and failed to log task context)")
+                    finally:
+                        work_q.task_done()
+
+            for i in range(worker_count):
+                t = threading.Thread(target=worker, daemon=True, name=f"worker-{i+1:02d}")
+                t.start()
+                threads.append(t)
+
+            # Wait for all tasks to finish or stop requested
             while not stop_event.is_set():
                 try:
-                    task = work_q.get_nowait()
-                except queue.Empty:
+                    work_q.join()
                     break
-                try:
-                    sync_single_repo_task(task)
-                finally:
-                    work_q.task_done()
+                except KeyboardInterrupt:
+                    stop_event.set()
+                    break
+        except Exception as exc:
+            human_log(f"Unexpected error in sync cycle: {oneline(scrub_text(str(exc)))}", level="error")
+        finally:
+            # Ensure threads exit
+            for t in threads:
+                t.join(timeout=1)
 
-        for _ in range(worker_count):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            threads.append(t)
-
-        # Wait for all tasks to finish or stop requested
-        while not stop_event.is_set():
-            try:
-                work_q.join()
-                break
-            except KeyboardInterrupt:
-                stop_event.set()
-                break
-
-        # Ensure threads exit
-        for t in threads:
-            t.join(timeout=1)
-
-        # Summaries
+        # Summaries (even if cycle had partial failures)
         print_summary(results)
         notify_slack_summary(SLACK_WEBHOOK_URL, cycle_start, results)
 
+        # Optional GitLab count for the root group
+        try:
+            gl_count = gitlab_destination.count_projects_in_group("marktech-sync")
+            human_log(f"Gitlab: Found {gl_count} repositories.")
+        except Exception:
+            pass
+
         if stop_event.is_set():
             break
-        logger.info(f"=== Sync cycle complete. Sleeping {SLEEP_SECONDS} seconds ===")
+        human_log(f"=== Sync cycle complete. Sleeping {SLEEP_SECONDS} seconds ===")
         # Sleep in a stop-aware way
         waited = 0
         while waited < SLEEP_SECONDS and not stop_event.is_set():
